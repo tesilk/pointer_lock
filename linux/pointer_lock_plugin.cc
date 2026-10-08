@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "pointer_lock_plugin_private.h"
+#include "wayland_pointer_lock.h"
 
 #define POINTER_LOCK_PLUGIN(obj) \
   (G_TYPE_CHECK_INSTANCE_CAST((obj), pointer_lock_plugin_get_type(), \
@@ -94,7 +95,14 @@ static void pointer_lock_plugin_handle_method_call(
     {
         set_pointer_visible(self, true);
         set_pointer_locked(self, false);
+        wayland_pointer_lock_end();
         response = success_response();
+    }
+    else if (strcmp(method, "nativeSessionAvailable") == 0)
+    {
+        FlView* fl_view = fl_plugin_registrar_get_view(self->registrar);
+        g_autoptr(FlValue) result = fl_value_new_bool(wayland_pointer_lock_is_available(fl_view));
+        response = FL_METHOD_RESPONSE(fl_method_success_response_new(result));
     }
     else if (strcmp(method, "hidePointer") == 0)
     {
@@ -251,6 +259,28 @@ static void method_call_cb(FlMethodChannel* channel, FlMethodCall* method_call,
     pointer_lock_plugin_handle_method_call(plugin, method_call);
 }
 
+static FlMethodErrorResponse* session_listen_cb(FlEventChannel* channel, FlValue* args, gpointer user_data)
+{
+    PointerLockPlugin* plugin = POINTER_LOCK_PLUGIN(user_data);
+    bool unlock_on_pointer_up =
+        args != nullptr && fl_value_get_type(args) == FL_VALUE_TYPE_BOOL && fl_value_get_bool(args);
+    FlView* fl_view = fl_plugin_registrar_get_view(plugin->registrar);
+    // A failed listen reply never reaches the stream, so the failure travels as an event that ends the session.
+    if (!wayland_pointer_lock_begin(fl_view, channel, unlock_on_pointer_up))
+    {
+        fl_event_channel_send_error(channel, "Native pointer lock failed", "No Wayland surface or pointer to lock",
+                                    nullptr, nullptr, nullptr);
+        fl_event_channel_send_end_of_stream(channel, nullptr, nullptr);
+    }
+    return nullptr;
+}
+
+static FlMethodErrorResponse* session_cancel_cb(FlEventChannel* channel, FlValue* args, gpointer user_data)
+{
+    wayland_pointer_lock_end();
+    return nullptr;
+}
+
 void pointer_lock_plugin_register_with_registrar(FlPluginRegistrar* registrar)
 {
     // Initialize plugin
@@ -268,6 +298,10 @@ void pointer_lock_plugin_register_with_registrar(FlPluginRegistrar* registrar)
     fl_method_channel_set_method_call_handler(method_channel, method_call_cb,
                                               g_object_ref(plugin),
                                               g_object_unref);
+    g_autoptr(FlEventChannel) session_channel =
+        fl_event_channel_new(messenger, "pointer_lock_session", FL_METHOD_CODEC(codec));
+    fl_event_channel_set_stream_handlers(session_channel, session_listen_cb, session_cancel_cb, g_object_ref(plugin),
+                                         g_object_unref);
 
     g_object_unref(plugin);
 }

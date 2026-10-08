@@ -4,8 +4,8 @@ A Flutter plug-in that makes it possible to lock the mouse pointer to its curren
 and receive movement deltas while the pointer is locked.
 
 | Windows | macOS | Linux (x11) | Linux (Wayland) |        Web        |
-|:-------:|:-----:|:-----------:|-----------------|:-----------------:|
-|   ✔️    |  ✔️   |     ✔️         | so so           | Experimental️ (*) |
+|:-------:|:-----:|:-----------:|:---------------:|:-----------------:|
+|   ✔️    |  ✔️   |     ✔️      |       ✔️        | Experimental️ (*) |
 
 ## Installation
 
@@ -63,10 +63,33 @@ Use whatever works best for you!
 
 ### Linux
 
-On Linux, things work okay in X11. The implementation is based on the GDK 
-functions `gdk_pointer_grab` and `gdk_device_warp`.
+On X11, the implementation is based on the GDK functions `gdk_pointer_grab` and `gdk_device_warp`: the pointer is
+grabbed, and every motion event that reaches Dart asks the native side for the delta, which then warps the pointer back
+to where it was locked.
 
-On Wayland, I had varying experiences. On my Ubuntu VM running via UTM on macOS, it works. On my Zorin OS distro which runs on bare metal, the pointer easily escapes. This appeared to work better with the X11 functions `XGrabCursor` and `XWarpCursor` (which were replaced with GDK functions in commit 942a4c39). But with the X11 functions, I observed crashes in advanced usage scenarios ... maybe it's time to use the "pointer-constraints-unstable-v1" API on Wayland?
+That approach can't work on Wayland:
+
+- Core Wayland has no request that lets a client move the pointer, so the warp can't put it back. (The newer staging
+  `pointer-warp-v1` protocol adds one, but GTK 3 doesn't use it, and the protocol itself says it is no reliable way to
+  lock the pointer.)
+- A grab is not a confinement: the compositor keeps moving the pointer, out of the window if the mouse goes there.
+- The warp is asynchronous (motion event → Dart → native warp), so a fast move leaves the window before the warp
+  lands, the window stops receiving motion, and the lock is lost.
+
+So on Wayland the plug-in locks natively instead: it asks the compositor to lock the pointer with the
+`pointer-constraints-unstable-v1` protocol and reads the deltas from `relative-pointer-unstable-v1`. The native side
+drives the session and sends the deltas over the event channel, as on macOS. This brings a few behaviours:
+
+- The session stream ends when the compositor releases the lock, for example when the window loses focus.
+- Deltas are only sent once the compositor confirms the lock, so motion before it isn't counted twice (once as a
+  pointer move, once as a delta).
+- A session that can't lock (for example on a seat without a pointer) reports a `PlatformException` on the stream and
+  ends.
+- Tested compositor: KWin 6.7.
+
+The Wayland path needs the `wayland-client` development package at build time (`libwayland-dev` on Debian and Ubuntu);
+without it, the plug-in builds with the X11 path only. On X11, or on a compositor that lacks either protocol, the GDK
+path above is used.
 
 ### Web (*)
 
@@ -84,10 +107,17 @@ Known issues:
 
 ### Linux
 
+#### Wayland bindings
+
+The protocol bindings in `linux/include/wayland/` and `linux/wayland/` are generated from the protocol XML in
+`linux/protocols/` (copied from wayland-protocols) by `tool/generate_wayland_protocols.sh`, which needs
+`wayland-scanner`. They are checked in so that apps using the plug-in build without it; re-run the script after
+updating an XML.
+
 #### Room for improvement
 
 There's room for improvement for the Linux platform:
 
-- For Wayland, we could use the Wayland-specific "pointer-constraints-unstable-v1" API in order
-  to allow for a smoother pointer locking experience. A few experiments have been done already
-  (see commit 9216f16aa188268e6 in which the experimental Wayland code was removed).
+- The Wayland lock is one-shot: once the compositor releases it (for example when the window loses focus), the session
+  ends instead of resuming when the window gets focus back. A persistent lock could resume, at the cost of tracking
+  the lock across focus changes.

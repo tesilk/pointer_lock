@@ -18,13 +18,15 @@ class ChannelPointerLock extends PointerLockPlatform {
 
   var _initialized = false;
 
+  Future<bool>? _nativeSessionAvailability;
+
   @override
   Future<void> ensureInitialized() async {
     if (_initialized) {
       return;
     }
     _initialized = true;
-    await methodChannel.invokeMethod<void>('flutterRestart');
+    await _invokeIgnoringMissingPlugin('flutterRestart');
   }
 
   @override
@@ -68,14 +70,22 @@ class ChannelPointerLock extends PointerLockPlatform {
     StreamSubscription<PointerLockMoveEvent>? rawStreamSubscription;
     controller.onListen = () async {
       if (cursor == PointerLockCursor.hidden) {
-        await _hidePointer();
+        try {
+          await _hidePointer();
+        } catch (error, stackTrace) {
+          controller.addError(error, stackTrace);
+          await controller.close();
+          return;
+        }
+        if (!controller.hasListener) {
+          return;
+        }
       }
-      // Reacting to onDone is not necessary because the raw stream is infinite
       rawStreamSubscription = rawStream.listen(
         controller.add,
         cancelOnError: false,
         onError: (Object error) => controller.addError(error),
-        // This will only be called if the raw stream was created with unlockOnPointerUp (automatic unlocking)
+        // The raw stream ends on its own with unlockOnPointerUp, when the compositor releases a Wayland lock, or when locking failed.
         onDone: () => controller.close(),
       );
     };
@@ -98,9 +108,21 @@ class ChannelPointerLock extends PointerLockPlatform {
   }) {
     final previousCallback = PlatformDispatcher.instance.onPointerDataPacket!;
     final controller = StreamController<PointerLockMoveEvent>();
+    var isPointerDataPacketHookInstalled = false;
     controller.onListen = () async {
-      await _subscribeToRawInputData();
-      await _lockPointer();
+      try {
+        await _subscribeToRawInputData();
+        await _lockPointer();
+      } catch (error, stackTrace) {
+        controller.addError(error, stackTrace);
+        await controller.close();
+        return;
+      }
+      // Cancelled while locking: the unlock already ran, so a hook installed now would never be removed.
+      if (!controller.hasListener) {
+        return;
+      }
+      isPointerDataPacketHookInstalled = true;
       PlatformDispatcher.instance.onPointerDataPacket = (packet) async {
         var unlock = false;
         var containsMotionEvents = false;
@@ -163,7 +185,9 @@ class ChannelPointerLock extends PointerLockPlatform {
       };
     };
     controller.done.whenComplete(() async {
-      PlatformDispatcher.instance.onPointerDataPacket = previousCallback;
+      if (isPointerDataPacketHookInstalled) {
+        PlatformDispatcher.instance.onPointerDataPacket = previousCallback;
+      }
       await _unlockPointer();
     });
     return controller.stream;
@@ -190,10 +214,26 @@ class ChannelPointerLock extends PointerLockPlatform {
       // when doing locking the pointer via CGAssociateMouseAndMouseCursorPosition(0), the absolute coordinates don't
       // change anymore.
       return _createRawStreamNative(unlockOnPointerUp: unlockOnPointerUp);
+    } else if (defaultTargetPlatform == TargetPlatform.linux) {
+      // Wayland clients can't warp the pointer, so the native side locks it there and sends the deltas.
+      // On X11, Dart-controlled streams are fine.
+      return _createRawStreamLinux(unlockOnPointerUp: unlockOnPointerUp);
     } else {
-      // On Linux, we are fine with Dart-controlled streams.
       return _createRawStreamDart(unlockOnPointerUp: unlockOnPointerUp);
     }
+  }
+
+  Stream<PointerLockMoveEvent> _createRawStreamLinux({
+    required bool unlockOnPointerUp,
+  }) async* {
+    final isNativeSessionAvailable = await (_nativeSessionAvailability ??= _queryNativeSessionAvailable());
+    yield* isNativeSessionAvailable
+        ? _createRawStreamNative(unlockOnPointerUp: unlockOnPointerUp)
+        : _createRawStreamDart(unlockOnPointerUp: unlockOnPointerUp);
+  }
+
+  Future<bool> _queryNativeSessionAvailable() async {
+    return await methodChannel.invokeMethod<bool>('nativeSessionAvailable') ?? false;
   }
 
   /// Creates a Stream that is driven by the native code.
@@ -217,11 +257,20 @@ class ChannelPointerLock extends PointerLockPlatform {
   }
 
   Future<void> _unlockPointer() {
-    return methodChannel.invokeMethod<void>('unlockPointer');
+    return _invokeIgnoringMissingPlugin('unlockPointer');
   }
 
   Future<void> _showPointer() {
-    return methodChannel.invokeMethod<void>('showPointer');
+    return _invokeIgnoringMissingPlugin('showPointer');
+  }
+
+  /// A platform without a native side (Android, iOS) has nothing to reset or undo.
+  Future<void> _invokeIgnoringMissingPlugin(String method) async {
+    try {
+      await methodChannel.invokeMethod<void>(method);
+    } on MissingPluginException {
+      return;
+    }
   }
 
   Future<void> _hidePointer() {

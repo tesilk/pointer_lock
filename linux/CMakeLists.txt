@@ -5,14 +5,23 @@ cmake_minimum_required(VERSION 3.10)
 
 # Project-level configuration.
 set(PROJECT_NAME "pointer_lock")
-project(${PROJECT_NAME} LANGUAGES CXX)
+project(${PROJECT_NAME} LANGUAGES C CXX)
 
 # This value is used when generating builds using this plugin, so it must
 # not be changed.
 set(PLUGIN_NAME "pointer_lock_plugin")
 
 # Any new source files that you add to the plugin should be added here.
-list(APPEND PLUGIN_SOURCES "pointer_lock_plugin.cc")
+list(APPEND PLUGIN_SOURCES "pointer_lock_plugin.cc" "wayland_pointer_lock.cc")
+
+# Without wayland-client the plugin builds X11-only.
+pkg_check_modules(WAYLAND_CLIENT IMPORTED_TARGET wayland-client)
+if(WAYLAND_CLIENT_FOUND)
+  list(APPEND PLUGIN_SOURCES
+    "wayland/pointer-constraints-unstable-v1-protocol.c"
+    "wayland/relative-pointer-unstable-v1-protocol.c"
+  )
+endif()
 
 # Define the plugin library target. Its name must not be changed (see comment
 # on PLUGIN_NAME above).
@@ -38,6 +47,11 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(${PLUGIN_NAME} PRIVATE flutter)
 target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::GTK)
+if(WAYLAND_CLIENT_FOUND)
+  target_include_directories(${PLUGIN_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(${PLUGIN_NAME} PRIVATE PkgConfig::WAYLAND_CLIENT)
+  target_compile_definitions(${PLUGIN_NAME} PRIVATE POINTER_LOCK_HAS_WAYLAND)
+endif()
 
 # List of absolute paths to libraries that should be bundled with the plugin.
 # This list could contain prebuilt libraries, or libraries created by an
@@ -83,6 +97,11 @@ target_include_directories(${TEST_RUNNER} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(${TEST_RUNNER} PRIVATE flutter)
 target_link_libraries(${TEST_RUNNER} PRIVATE PkgConfig::GTK)
 target_link_libraries(${TEST_RUNNER} PRIVATE gtest_main gmock)
+if(WAYLAND_CLIENT_FOUND)
+  target_include_directories(${TEST_RUNNER} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(${TEST_RUNNER} PRIVATE PkgConfig::WAYLAND_CLIENT)
+  target_compile_definitions(${TEST_RUNNER} PRIVATE POINTER_LOCK_HAS_WAYLAND)
+endif()
 
 # Enable automatic test discovery.
 include(GoogleTest)
